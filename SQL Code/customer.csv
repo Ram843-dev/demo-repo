@@ -1,0 +1,26 @@
+CREATE TABLE STUDENT_SCHEMA.CUSTOMER (
+    CUSTOMER_ID INT,
+    CUSTOMER_NAME VARCHAR(100),
+    CITY VARCHAR(50),
+    COUNTRY VARCHAR(50),
+    AGE INT,
+    PURCHASE_AMOUNT NUMBER(10,2)
+);
+
+
+INSERT INTO STUDENT_SCHEMA.CUSTOMER
+VALUES
+(101, 'Ravi', 'Hyderabad', 'India', 25, 15000),
+(102, 'Priya', 'Chennai', 'India', 30, 25000),
+(103, 'John', 'New York', 'USA', 35, 50000),
+(104, 'Anusha', 'Hyderabad', 'India', 28, 18000),
+(105, 'David', 'London', 'UK', 40, 40000),
+(106, 'Sneha', 'Bangalore', 'India', 24, 12000),
+(107, 'Rahul', 'Mumbai', 'India', 32, 30000),
+(108, 'Sarah', 'London', 'UK', 29, 35000),
+(109, 'Kiran', 'Hyderabad', 'India', 26, 22000),
+(110, 'Mike', 'New York', 'USA', 45, 60000);
+
+
+SELECT *
+FROM STUDENT_SCHEMA.CUSTOMER;
