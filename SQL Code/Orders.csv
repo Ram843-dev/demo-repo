@@ -1,0 +1,27 @@
+CREATE TABLE STUDENT_SCHEMA.ORDERS (
+    ORDER_ID INT,
+    CUSTOMER_NAME VARCHAR(100),
+    PRODUCT VARCHAR(100),
+    QUANTITY INT,
+    PRICE NUMBER(10,2),
+    CITY VARCHAR(50)
+);
+
+
+
+INSERT INTO STUDENT_SCHEMA.ORDERS
+VALUES
+(1, 'Ravi', 'Laptop', 1, 55000, 'Hyderabad'),
+(2, 'Priya', 'Mobile', 2, 20000, 'Chennai'),
+(3, 'Kiran', 'Tablet', 1, 30000, 'Bangalore'),
+(4, 'Anusha', 'Headphones', 3, 1500, 'Hyderabad'),
+(5, 'Rahul', 'Laptop', 2, 60000, 'Mumbai'),
+(6, 'Sneha', 'Keyboard', 2, 2500, 'Chennai'),
+(7, 'Arjun', 'Mobile', 1, 25000, 'Hyderabad'),
+(8, 'Divya', 'Monitor', 2, 12000, 'Bangalore'),
+(9, 'Suresh', 'Mouse', 5, 800, 'Mumbai'),
+(10, 'Meena', 'Tablet', 2, 28000, 'Hyderabad');
+
+
+SELECT *
+FROM STUDENT_SCHEMA.ORDERS;
