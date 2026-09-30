@@ -1,0 +1,625 @@
+/* =====================================================================
+   SNOWFLAKE AUTOMATED E-COMMERCE PIPELINE  -  CLEAN STEP-BY-STEP SCRIPT
+
+   Flow: JSON files -> Stage -> RAW table -> Stream -> Stored Procedure
+         -> Task -> DIM tables + FACT table -> Power BI
+
+   HOW TO RUN
+   - Run ONE STEP AT A TIME: select only that step's code, press Ctrl+Enter.
+   - After each step read the result panel. Fix any red error before moving on.
+   - Every step is safe to re-run (IF NOT EXISTS), so nothing is lost.
+   - Steps 1-10 are done ONCE (setup + first load).
+     Steps 11-12 turn on the automation. After that you only upload files.
+   ===================================================================== */
+
+/* =====================================================================
+   STEP 1 : ROLE, WAREHOUSE, PRIVILEGE FOR TASKS
+   Run the GRANT ONCE as ACCOUNTADMIN, then come back to SYSADMIN.
+   ===================================================================== */
+USE ROLE ACCOUNTADMIN;
+GRANT EXECUTE TASK ON ACCOUNT TO ROLE SYSADMIN;
+
+USE ROLE SYSADMIN;
+USE WAREHOUSE COMPUTE_WH;
+
+/* =====================================================================
+   STEP 2 : DATABASE AND SCHEMAS
+   ===================================================================== */
+CREATE DATABASE IF NOT EXISTS ECOMMERCE_DATABASE;
+CREATE SCHEMA   IF NOT EXISTS ECOMMERCE_DATABASE.RAW_SCHEMA;
+CREATE SCHEMA   IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA;
+
+USE DATABASE ECOMMERCE_DATABASE;
+
+/* =====================================================================
+   STEP 3 : FILE FORMAT AND STAGE
+   STRIP_OUTER_ARRAY = TRUE: a file like [ {order}, {order} ] becomes one row per order.
+   ===================================================================== */
+CREATE FILE FORMAT IF NOT EXISTS ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_JSON_FORMAT
+    TYPE = JSON
+    STRIP_OUTER_ARRAY = TRUE;
+
+CREATE STAGE IF NOT EXISTS ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_STAGE
+    FILE_FORMAT = ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_JSON_FORMAT;
+
+/* =====================================================================
+   STEP 4 : UPLOAD THE JSON FILES (done in the Snowsight screen, not SQL)
+   Click the + icon (far-left menu) -> Add Data -> Load files into a Stage.
+   Pick ECOMMERCE_DATABASE -> RAW_SCHEMA -> ECOMMERCE_STAGE, clear the folder-path box,
+   drag in the files, click Upload. Then run the LIST below: you must see every file.
+   ===================================================================== */
+LIST @ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_STAGE;
+
+/* =====================================================================
+   STEP 5 : RAW TABLE (raw JSON kept exactly as received)
+   ===================================================================== */
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS
+(
+    VARIANT_COL VARIANT,
+    FILE_NAME   STRING,
+    LOAD_TS     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+/* =====================================================================
+   STEP 6 : DIMENSION, FACT, STAGING AND LOG TABLES
+   Expect 7 tables in DW_SCHEMA after this step.
+   ===================================================================== */
+-- 4.1 Customer dimension
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER
+(
+    CUSTOMER_KEY  NUMBER AUTOINCREMENT START 1 INCREMENT 1,
+    CUSTOMER_ID   STRING,
+    CUSTOMER_NAME STRING,
+    CITY          STRING,
+    STATE         STRING,
+    CREATED_TS    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_TS    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- 4.2 Product dimension
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT
+(
+    PRODUCT_KEY   NUMBER AUTOINCREMENT START 1 INCREMENT 1,
+    PRODUCT_ID    STRING,
+    PRODUCT_NAME  STRING,
+    CATEGORY      STRING,
+    CREATED_TS    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    UPDATED_TS    TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- 4.3 Payment dimension
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PAYMENT
+(
+    PAYMENT_KEY    NUMBER AUTOINCREMENT START 1 INCREMENT 1,
+    PAYMENT_METHOD STRING,
+    PAYMENT_STATUS STRING
+);
+
+-- 4.4 Date dimension
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.DIM_DATE
+(
+    DATE_KEY   NUMBER,            -- format YYYYMMDD, e.g. 20261001
+    FULL_DATE  DATE,
+    DAY        NUMBER,
+    MONTH      NUMBER,
+    MONTH_NAME STRING,
+    QUARTER    NUMBER,
+    YEAR       NUMBER
+);
+
+-- 4.5 Fact table (one row per order line item)
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS
+(
+    SALES_LINE_ID STRING,          -- ORDER_ID || '-' || ITEM_INDEX  (unique)
+    ORDER_ID      STRING,
+    DATE_KEY      NUMBER,
+    CUSTOMER_KEY  NUMBER,
+    PRODUCT_KEY   NUMBER,
+    PAYMENT_KEY   NUMBER,
+    QUANTITY      NUMBER,
+    UNIT_PRICE    NUMBER(10,2),
+    UNIT_COST     NUMBER(10,2),
+    SALES_AMOUNT  NUMBER(12,2),
+    PROFIT        NUMBER(12,2),
+    SOURCE_FILE   STRING,
+    LOAD_TS       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- 4.6 Staging table (flattened new rows for each run; cleared by the procedure)
+CREATE TRANSIENT TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES
+(
+    SALES_LINE_ID  STRING,
+    ORDER_ID       STRING,
+    ORDER_DATE     DATE,
+    CUSTOMER_ID    STRING,
+    CUSTOMER_NAME  STRING,
+    CITY           STRING,
+    STATE          STRING,
+    PAYMENT_METHOD STRING,
+    PAYMENT_STATUS STRING,
+    ITEM_INDEX     NUMBER,
+    PRODUCT_ID     STRING,
+    PRODUCT_NAME   STRING,
+    CATEGORY       STRING,
+    QUANTITY       NUMBER,
+    UNIT_PRICE     NUMBER(10,2),
+    UNIT_COST      NUMBER(10,2),
+    FILE_NAME      STRING,
+    LOAD_TS        TIMESTAMP_NTZ
+);
+
+-- 4.7 Run log (one row per procedure run)
+CREATE TABLE IF NOT EXISTS ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG
+(
+    RUN_TS       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    STATUS       STRING,
+    ROWS_STAGED  NUMBER,
+    ROWS_FACT    NUMBER,
+    MESSAGE      STRING
+);
+
+SHOW TABLES IN SCHEMA ECOMMERCE_DATABASE.DW_SCHEMA;
+
+/* =====================================================================
+   STEP 7 : FILL DIM_DATE ONCE (2020-01-01 to 2035-12-31)
+   Expected result: DATE_ROWS = 5844.
+   ===================================================================== */
+MERGE INTO ECOMMERCE_DATABASE.DW_SCHEMA.DIM_DATE T
+USING
+(
+    SELECT
+        TO_NUMBER(TO_CHAR(D, 'YYYYMMDD')) AS DATE_KEY,
+        D                                 AS FULL_DATE,
+        DAY(D)                            AS DAY,
+        MONTH(D)                          AS MONTH,
+        TO_CHAR(D, 'MMMM')                AS MONTH_NAME,
+        QUARTER(D)                        AS QUARTER,
+        YEAR(D)                           AS YEAR
+    FROM (
+        SELECT DATEADD(DAY, SEQ4(), '2020-01-01'::DATE) AS D
+        FROM TABLE(GENERATOR(ROWCOUNT => 5844))
+    )
+) S
+ON T.DATE_KEY = S.DATE_KEY
+WHEN NOT MATCHED THEN
+    INSERT (DATE_KEY, FULL_DATE, DAY, MONTH, MONTH_NAME, QUARTER, YEAR)
+    VALUES (S.DATE_KEY, S.FULL_DATE, S.DAY, S.MONTH, S.MONTH_NAME, S.QUARTER, S.YEAR);
+
+SELECT COUNT(*) AS DATE_ROWS, MIN(FULL_DATE), MAX(FULL_DATE) FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_DATE;
+
+/* =====================================================================
+   STEP 8 : STREAM ON THE RAW TABLE (detects new rows)
+   SHOW_INITIAL_ROWS = TRUE: rows already in RAW count as new on the first run.
+   ===================================================================== */
+CREATE STREAM IF NOT EXISTS ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_ORDER_STREAM
+    ON TABLE ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS
+    APPEND_ONLY = TRUE
+    SHOW_INITIAL_ROWS = TRUE;
+
+SHOW STREAMS IN SCHEMA ECOMMERCE_DATABASE.RAW_SCHEMA;
+
+/* =====================================================================
+   STEP 9 : STORED PROCEDURE (the transformation engine)
+   Select everything from CREATE down to the last line (two dollar signs + semicolon)
+   and run it as ONE statement. It does:
+   1 stream -> flattened staging table   2 MERGE the 4 dimensions
+   3 MERGE the fact table (no duplicates)   4 COMMIT + log row (error -> ROLLBACK)
+   ===================================================================== */
+CREATE OR REPLACE PROCEDURE ECOMMERCE_DATABASE.DW_SCHEMA.PROCESS_ECOMMERCE_DATA()
+RETURNS STRING
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS
+$$
+DECLARE
+    v_staged NUMBER DEFAULT 0;
+    v_fact   NUMBER DEFAULT 0;
+BEGIN
+
+    BEGIN TRANSACTION;
+
+    -- ---------------------------------------------------------------
+    -- STEP 1 : flatten new RAW rows into the staging table
+    -- ---------------------------------------------------------------
+    DELETE FROM ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES;
+
+    INSERT INTO ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES
+    (
+        SALES_LINE_ID, ORDER_ID, ORDER_DATE, CUSTOMER_ID, CUSTOMER_NAME, CITY, STATE,
+        PAYMENT_METHOD, PAYMENT_STATUS, ITEM_INDEX, PRODUCT_ID, PRODUCT_NAME, CATEGORY,
+        QUANTITY, UNIT_PRICE, UNIT_COST, FILE_NAME, LOAD_TS
+    )
+    SELECT
+        R.VARIANT_COL:order_id::STRING || '-' || F.INDEX::STRING           AS SALES_LINE_ID,
+        R.VARIANT_COL:order_id::STRING                                      AS ORDER_ID,
+        TRY_TO_DATE(R.VARIANT_COL:order_date::STRING)                       AS ORDER_DATE,
+        R.VARIANT_COL:customer.customer_id::STRING                          AS CUSTOMER_ID,
+        R.VARIANT_COL:customer.customer_name::STRING                        AS CUSTOMER_NAME,
+        R.VARIANT_COL:customer.city::STRING                                 AS CITY,
+        R.VARIANT_COL:customer.state::STRING                                AS STATE,
+        COALESCE(R.VARIANT_COL:payment.payment_method::STRING, 'UNKNOWN')   AS PAYMENT_METHOD,
+        COALESCE(R.VARIANT_COL:payment.payment_status::STRING, 'UNKNOWN')   AS PAYMENT_STATUS,
+        F.INDEX                                                             AS ITEM_INDEX,
+        F.VALUE:product_id::STRING                                          AS PRODUCT_ID,
+        F.VALUE:product_name::STRING                                        AS PRODUCT_NAME,
+        F.VALUE:category::STRING                                            AS CATEGORY,
+        F.VALUE:quantity::NUMBER                                            AS QUANTITY,
+        F.VALUE:unit_price::NUMBER(10,2)                                    AS UNIT_PRICE,
+        F.VALUE:unit_cost::NUMBER(10,2)                                     AS UNIT_COST,
+        R.FILE_NAME,
+        R.LOAD_TS
+    FROM ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_ORDER_STREAM R,
+         LATERAL FLATTEN(INPUT => R.VARIANT_COL:items) F
+    WHERE R.VARIANT_COL:order_id IS NOT NULL
+    -- if the same order arrives twice in one batch, keep the latest copy
+    QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY R.VARIANT_COL:order_id::STRING, F.INDEX
+                ORDER BY R.LOAD_TS DESC
+            ) = 1;
+
+    v_staged := SQLROWCOUNT;
+
+    IF (v_staged = 0) THEN
+        COMMIT;
+        INSERT INTO ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG (STATUS, ROWS_STAGED, ROWS_FACT, MESSAGE)
+        VALUES ('NO_DATA', 0, 0, 'No new rows in stream');
+        RETURN 'NO_DATA: no new rows in stream';
+    END IF;
+
+    -- ---------------------------------------------------------------
+    -- STEP 2a : DIM_CUSTOMER  (new customers inserted, changed ones updated)
+    -- ---------------------------------------------------------------
+    MERGE INTO ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER T
+    USING
+    (
+        SELECT CUSTOMER_ID, CUSTOMER_NAME, CITY, STATE
+        FROM ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES
+        WHERE CUSTOMER_ID IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY CUSTOMER_ID ORDER BY ORDER_DATE DESC, LOAD_TS DESC) = 1
+    ) S
+    ON T.CUSTOMER_ID = S.CUSTOMER_ID
+    WHEN MATCHED AND (   NOT EQUAL_NULL(T.CUSTOMER_NAME, S.CUSTOMER_NAME)
+                      OR NOT EQUAL_NULL(T.CITY, S.CITY)
+                      OR NOT EQUAL_NULL(T.STATE, S.STATE)) THEN
+        UPDATE SET T.CUSTOMER_NAME = S.CUSTOMER_NAME,
+                   T.CITY          = S.CITY,
+                   T.STATE         = S.STATE,
+                   T.UPDATED_TS    = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN
+        INSERT (CUSTOMER_ID, CUSTOMER_NAME, CITY, STATE)
+        VALUES (S.CUSTOMER_ID, S.CUSTOMER_NAME, S.CITY, S.STATE);
+
+    -- ---------------------------------------------------------------
+    -- STEP 2b : DIM_PRODUCT
+    -- ---------------------------------------------------------------
+    MERGE INTO ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT T
+    USING
+    (
+        SELECT PRODUCT_ID, PRODUCT_NAME, CATEGORY
+        FROM ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES
+        WHERE PRODUCT_ID IS NOT NULL
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY PRODUCT_ID ORDER BY ORDER_DATE DESC, LOAD_TS DESC) = 1
+    ) S
+    ON T.PRODUCT_ID = S.PRODUCT_ID
+    WHEN MATCHED AND (   NOT EQUAL_NULL(T.PRODUCT_NAME, S.PRODUCT_NAME)
+                      OR NOT EQUAL_NULL(T.CATEGORY, S.CATEGORY)) THEN
+        UPDATE SET T.PRODUCT_NAME = S.PRODUCT_NAME,
+                   T.CATEGORY     = S.CATEGORY,
+                   T.UPDATED_TS   = CURRENT_TIMESTAMP()
+    WHEN NOT MATCHED THEN
+        INSERT (PRODUCT_ID, PRODUCT_NAME, CATEGORY)
+        VALUES (S.PRODUCT_ID, S.PRODUCT_NAME, S.CATEGORY);
+
+    -- ---------------------------------------------------------------
+    -- STEP 2c : DIM_PAYMENT  (unique METHOD + STATUS combination)
+    -- ---------------------------------------------------------------
+    MERGE INTO ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PAYMENT T
+    USING
+    (
+        SELECT DISTINCT PAYMENT_METHOD, PAYMENT_STATUS
+        FROM ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES
+    ) S
+    ON  T.PAYMENT_METHOD = S.PAYMENT_METHOD
+    AND T.PAYMENT_STATUS = S.PAYMENT_STATUS
+    WHEN NOT MATCHED THEN
+        INSERT (PAYMENT_METHOD, PAYMENT_STATUS)
+        VALUES (S.PAYMENT_METHOD, S.PAYMENT_STATUS);
+
+    -- ---------------------------------------------------------------
+    -- STEP 2d : DIM_DATE  (adds any order date missing from the calendar)
+    -- ---------------------------------------------------------------
+    MERGE INTO ECOMMERCE_DATABASE.DW_SCHEMA.DIM_DATE T
+    USING
+    (
+        SELECT DISTINCT
+            TO_NUMBER(TO_CHAR(ORDER_DATE, 'YYYYMMDD')) AS DATE_KEY,
+            ORDER_DATE                                  AS FULL_DATE,
+            DAY(ORDER_DATE)                             AS DAY,
+            MONTH(ORDER_DATE)                           AS MONTH,
+            TO_CHAR(ORDER_DATE, 'MMMM')                 AS MONTH_NAME,
+            QUARTER(ORDER_DATE)                         AS QUARTER,
+            YEAR(ORDER_DATE)                            AS YEAR
+        FROM ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES
+        WHERE ORDER_DATE IS NOT NULL
+    ) S
+    ON T.DATE_KEY = S.DATE_KEY
+    WHEN NOT MATCHED THEN
+        INSERT (DATE_KEY, FULL_DATE, DAY, MONTH, MONTH_NAME, QUARTER, YEAR)
+        VALUES (S.DATE_KEY, S.FULL_DATE, S.DAY, S.MONTH, S.MONTH_NAME, S.QUARTER, S.YEAR);
+
+    -- ---------------------------------------------------------------
+    -- STEP 3 : FACT_ORDERS  (insert only lines not already present)
+    -- ---------------------------------------------------------------
+    MERGE INTO ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS T
+    USING
+    (
+        SELECT
+            S.SALES_LINE_ID,
+            S.ORDER_ID,
+            TO_NUMBER(TO_CHAR(S.ORDER_DATE, 'YYYYMMDD'))  AS DATE_KEY,
+            C.CUSTOMER_KEY,
+            P.PRODUCT_KEY,
+            PM.PAYMENT_KEY,
+            S.QUANTITY,
+            S.UNIT_PRICE,
+            S.UNIT_COST,
+            S.QUANTITY * S.UNIT_PRICE                     AS SALES_AMOUNT,
+            S.QUANTITY * (S.UNIT_PRICE - S.UNIT_COST)     AS PROFIT,
+            S.FILE_NAME
+        FROM ECOMMERCE_DATABASE.DW_SCHEMA.STG_ORDER_LINES S
+        JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER C  ON C.CUSTOMER_ID = S.CUSTOMER_ID
+        JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT  P  ON P.PRODUCT_ID  = S.PRODUCT_ID
+        JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PAYMENT  PM ON PM.PAYMENT_METHOD = S.PAYMENT_METHOD
+                                                          AND PM.PAYMENT_STATUS = S.PAYMENT_STATUS
+        WHERE S.ORDER_DATE IS NOT NULL
+    ) X
+    ON T.SALES_LINE_ID = X.SALES_LINE_ID
+    WHEN NOT MATCHED THEN
+        INSERT (SALES_LINE_ID, ORDER_ID, DATE_KEY, CUSTOMER_KEY, PRODUCT_KEY, PAYMENT_KEY,
+                QUANTITY, UNIT_PRICE, UNIT_COST, SALES_AMOUNT, PROFIT, SOURCE_FILE)
+        VALUES (X.SALES_LINE_ID, X.ORDER_ID, X.DATE_KEY, X.CUSTOMER_KEY, X.PRODUCT_KEY, X.PAYMENT_KEY,
+                X.QUANTITY, X.UNIT_PRICE, X.UNIT_COST, X.SALES_AMOUNT, X.PROFIT, X.FILE_NAME);
+
+    v_fact := SQLROWCOUNT;
+
+    COMMIT;
+
+    INSERT INTO ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG (STATUS, ROWS_STAGED, ROWS_FACT, MESSAGE)
+    VALUES ('SUCCESS', :v_staged, :v_fact, 'Load completed');
+
+    RETURN 'SUCCESS: staged=' || v_staged || ', fact rows inserted=' || v_fact;
+
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;   -- stream is NOT consumed, so the same rows are retried next run
+        INSERT INTO ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG (STATUS, ROWS_STAGED, ROWS_FACT, MESSAGE)
+        VALUES ('FAILED', 0, 0, :SQLERRM);
+        RAISE;
+END;
+$$;
+
+/* =====================================================================
+   STEP 10 : FIRST LOAD: files -> RAW -> DW tables
+   10.1 COPY INTO   10.2 CALL the procedure   10.3 check the numbers.
+   Run 10.2 only AFTER step 9. COPY never loads the same file twice.
+   ===================================================================== */
+-- 10.1 stage files -> RAW table
+COPY INTO ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS (VARIANT_COL, FILE_NAME, LOAD_TS)
+FROM (
+    SELECT $1, METADATA$FILENAME, CURRENT_TIMESTAMP()
+    FROM @ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = 'ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_JSON_FORMAT')
+ON_ERROR = 'SKIP_FILE';
+
+SELECT FILE_NAME, COUNT(*) AS ORDERS
+FROM ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS GROUP BY FILE_NAME;
+
+-- 10.2 RAW -> dimensions + fact
+CALL ECOMMERCE_DATABASE.DW_SCHEMA.PROCESS_ECOMMERCE_DATA();
+
+-- 10.3 check
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG ORDER BY RUN_TS DESC;
+
+SELECT 'DIM_CUSTOMER' AS TBL, COUNT(*) AS ROWS_ FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER
+UNION ALL SELECT 'DIM_PRODUCT', COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT
+UNION ALL SELECT 'DIM_PAYMENT', COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PAYMENT
+UNION ALL SELECT 'FACT_ORDERS', COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS;
+
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER ORDER BY CUSTOMER_KEY;
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT  ORDER BY PRODUCT_KEY;
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS  ORDER BY SALES_LINE_ID LIMIT 100;
+
+/* =====================================================================
+   STEP 11 : AUTOMATION: TWO TASKS
+   TASK_LOAD_RAW    (root)  : COPY INTO -> loads any NEW file found in the stage.
+   TASK_PROCESS_DW  (child) : runs after it, only if the stream has data -> CALL procedure.
+   Schedule: daily 1:00 AM India time. Tasks start SUSPENDED: resume child first, then root.
+   ===================================================================== */
+CREATE OR REPLACE TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE  = 'USING CRON 0 1 * * * Asia/Kolkata'
+AS
+COPY INTO ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS (VARIANT_COL, FILE_NAME, LOAD_TS)
+FROM (
+    SELECT $1, METADATA$FILENAME, CURRENT_TIMESTAMP()
+    FROM @ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = 'ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_JSON_FORMAT')
+ON_ERROR = 'SKIP_FILE';
+
+CREATE OR REPLACE TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_PROCESS_DW
+    WAREHOUSE = COMPUTE_WH
+    AFTER ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW
+    WHEN SYSTEM$STREAM_HAS_DATA('ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_ORDER_STREAM')
+AS
+CALL ECOMMERCE_DATABASE.DW_SCHEMA.PROCESS_ECOMMERCE_DATA();
+
+ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_PROCESS_DW RESUME;   -- child first
+ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW   RESUME;   -- then root
+
+SHOW TASKS IN SCHEMA ECOMMERCE_DATABASE.DW_SCHEMA;   -- both should say 'started'
+
+/* =====================================================================
+   STEP 12 : TEST THE AUTOMATION WITH A NEW FILE (incremental load)
+   1. Upload a NEW json file to the stage (Step 4 way).
+   2. Note the counts (12.1), run the task now (12.2), wait 30-60 sec, check (12.3).
+   Only the NEW file's rows are added. Old rows are never reloaded or duplicated.
+   ===================================================================== */
+-- 12.1 counts BEFORE
+SELECT 'RAW' AS TBL, COUNT(*) AS ROWS_ FROM ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS
+UNION ALL SELECT 'FACT_ORDERS', COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS
+UNION ALL SELECT 'DIM_CUSTOMER', COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER
+UNION ALL SELECT 'DIM_PRODUCT', COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT;
+
+-- 12.2 run the whole chain now (instead of waiting for 1 AM)
+EXECUTE TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW;
+
+-- 12.3 results (wait 30-60 seconds first)
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG ORDER BY RUN_TS DESC;
+
+SELECT NAME, STATE, SCHEDULED_TIME, COMPLETED_TIME, ERROR_MESSAGE
+FROM TABLE(ECOMMERCE_DATABASE.INFORMATION_SCHEMA.TASK_HISTORY(RESULT_LIMIT => 20))
+ORDER BY SCHEDULED_TIME DESC;
+
+-- with the sample incremental file: C101 city -> Bengaluru, plus new C126 and P121
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER WHERE CUSTOMER_ID IN ('C101','C126');
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT  WHERE PRODUCT_ID = 'P121';
+
+/* =====================================================================
+   STEP 13 : (OPTIONAL) CHANGE HOW OFTEN IT RUNS
+   Internal stages cannot trigger anything when a file lands, so the task checks on a schedule.
+   Every 5 minutes = near-real-time, but the warehouse wakes up every 5 minutes (cost).
+   To change the schedule: suspend root, change it, resume root (child stays resumed).
+   ===================================================================== */
+-- every 5 minutes
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW SUSPEND;
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW SET SCHEDULE = '5 MINUTE';
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW RESUME;
+
+-- back to daily 1 AM India time
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW SUSPEND;
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW SET SCHEDULE = 'USING CRON 0 1 * * * Asia/Kolkata';
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW RESUME;
+
+/* =====================================================================
+   STEP 14 : REPORTING VIEW FOR POWER BI + DATA QUALITY CHECKS
+   ===================================================================== */
+-- 12.1 One flat view (optional; Power BI can also connect to the 5 tables directly)
+CREATE OR REPLACE VIEW ECOMMERCE_DATABASE.DW_SCHEMA.VW_SALES_REPORT AS
+SELECT
+    F.SALES_LINE_ID, F.ORDER_ID,
+    D.FULL_DATE, D.DAY, D.MONTH, D.MONTH_NAME, D.QUARTER, D.YEAR,
+    C.CUSTOMER_ID, C.CUSTOMER_NAME, C.CITY, C.STATE,
+    P.PRODUCT_ID, P.PRODUCT_NAME, P.CATEGORY,
+    PM.PAYMENT_METHOD, PM.PAYMENT_STATUS,
+    F.QUANTITY, F.UNIT_PRICE, F.UNIT_COST, F.SALES_AMOUNT, F.PROFIT
+FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS F
+JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_DATE     D  ON F.DATE_KEY     = D.DATE_KEY
+JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_CUSTOMER C  ON F.CUSTOMER_KEY = C.CUSTOMER_KEY
+JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PRODUCT  P  ON F.PRODUCT_KEY  = P.PRODUCT_KEY
+JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_PAYMENT  PM ON F.PAYMENT_KEY  = PM.PAYMENT_KEY;
+
+-- 12.2 Daily / monthly / yearly sales from ONE fact table
+SELECT FULL_DATE,  SUM(SALES_AMOUNT) AS DAILY_SALES,   SUM(PROFIT) AS PROFIT
+FROM ECOMMERCE_DATABASE.DW_SCHEMA.VW_SALES_REPORT GROUP BY FULL_DATE ORDER BY FULL_DATE;
+
+SELECT YEAR, MONTH, MONTH_NAME, SUM(SALES_AMOUNT) AS MONTHLY_SALES, SUM(PROFIT) AS PROFIT
+FROM ECOMMERCE_DATABASE.DW_SCHEMA.VW_SALES_REPORT GROUP BY YEAR, MONTH, MONTH_NAME ORDER BY YEAR, MONTH;
+
+SELECT YEAR, SUM(SALES_AMOUNT) AS YEARLY_SALES, SUM(PROFIT) AS PROFIT
+FROM ECOMMERCE_DATABASE.DW_SCHEMA.VW_SALES_REPORT GROUP BY YEAR ORDER BY YEAR;
+
+-- 12.3 Data quality checks (all should return 0 rows / 0)
+-- duplicate fact lines
+SELECT SALES_LINE_ID, COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS GROUP BY SALES_LINE_ID HAVING COUNT(*) > 1;
+-- fact rows with a missing dimension key
+SELECT COUNT(*) AS BAD_ROWS FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS
+WHERE DATE_KEY IS NULL OR CUSTOMER_KEY IS NULL OR PRODUCT_KEY IS NULL OR PAYMENT_KEY IS NULL;
+-- fact keys with no matching date row
+SELECT COUNT(*) AS ORPHAN_DATES FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS F
+LEFT JOIN ECOMMERCE_DATABASE.DW_SCHEMA.DIM_DATE D ON F.DATE_KEY = D.DATE_KEY WHERE D.DATE_KEY IS NULL;
+-- raw items vs fact lines (numbers should match once the stream is empty)
+SELECT
+  (SELECT COUNT(*) FROM ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS R,
+        LATERAL FLATTEN(INPUT => R.VARIANT_COL:items) F) AS RAW_ITEM_LINES,
+  (SELECT COUNT(*) FROM ECOMMERCE_DATABASE.DW_SCHEMA.FACT_ORDERS)                        AS FACT_LINES;
+
+-- 12.4 Monitoring
+SELECT * FROM ECOMMERCE_DATABASE.DW_SCHEMA.ETL_RUN_LOG ORDER BY RUN_TS DESC LIMIT 20;
+SELECT * FROM TABLE(ECOMMERCE_DATABASE.INFORMATION_SCHEMA.COPY_HISTORY(
+        TABLE_NAME => 'RAW_ECOMMERCE_ORDERS',
+        START_TIME => DATEADD(DAY, -7, CURRENT_TIMESTAMP())))
+ORDER BY LAST_LOAD_TIME DESC;
+
+/* =====================================================================
+   STEP 15 : PAUSE / RESTART THE AUTOMATION
+   ===================================================================== */
+-- Pause (root first):
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW   SUSPEND;
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_PROCESS_DW SUSPEND;
+-- Restart (child first, then root):
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_PROCESS_DW RESUME;
+-- ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW   RESUME;
+
+/* =====================================================================
+   STEP 16 : (OPTIONAL, LATER) SNOWPIPE: load the instant a file lands
+   Needs an EXTERNAL stage (Azure Blob / S3 / GCS). It does not work with the internal stage.
+   Template for Azure Blob: replace every <placeholder>. Everything below is commented out.
+   ===================================================================== */
+/*
+-- 11.1 Storage integration (run as ACCOUNTADMIN)
+USE ROLE ACCOUNTADMIN;
+CREATE STORAGE INTEGRATION AZURE_ECOM_INT
+    TYPE = EXTERNAL_STAGE
+    STORAGE_PROVIDER = 'AZURE'
+    ENABLED = TRUE
+    AZURE_TENANT_ID = '<your-tenant-id>'
+    STORAGE_ALLOWED_LOCATIONS = ('azure://<storageaccount>.blob.core.windows.net/<container>/');
+DESC STORAGE INTEGRATION AZURE_ECOM_INT;   -- open AZURE_CONSENT_URL, accept; grant the app "Storage Blob Data Reader" on the container
+
+-- 11.2 Notification integration (Azure Storage Queue fed by Event Grid on blob-created events)
+CREATE NOTIFICATION INTEGRATION AZURE_ECOM_NOTIF
+    ENABLED = TRUE
+    TYPE = QUEUE
+    NOTIFICATION_PROVIDER = AZURE_STORAGE_QUEUE
+    AZURE_STORAGE_QUEUE_PRIMARY_URI = 'https://<storageaccount>.queue.core.windows.net/<queuename>'
+    AZURE_TENANT_ID = '<your-tenant-id>';
+DESC NOTIFICATION INTEGRATION AZURE_ECOM_NOTIF;   -- accept consent URL, give the app "Storage Queue Data Contributor" on the queue
+
+GRANT USAGE ON INTEGRATION AZURE_ECOM_INT   TO ROLE SYSADMIN;
+GRANT USAGE ON INTEGRATION AZURE_ECOM_NOTIF TO ROLE SYSADMIN;
+USE ROLE SYSADMIN;
+
+-- 11.3 External stage
+CREATE STAGE ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_EXT_STAGE
+    URL = 'azure://<storageaccount>.blob.core.windows.net/<container>/'
+    STORAGE_INTEGRATION = AZURE_ECOM_INT
+    FILE_FORMAT = ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_JSON_FORMAT;
+
+-- 11.4 Pipe
+CREATE PIPE ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_PIPE
+    AUTO_INGEST = TRUE
+    INTEGRATION = 'AZURE_ECOM_NOTIF'
+AS
+COPY INTO ECOMMERCE_DATABASE.RAW_SCHEMA.RAW_ECOMMERCE_ORDERS (VARIANT_COL, FILE_NAME, LOAD_TS)
+FROM (
+    SELECT $1, METADATA$FILENAME, CURRENT_TIMESTAMP()
+    FROM @ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_EXT_STAGE
+)
+FILE_FORMAT = (FORMAT_NAME = 'ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_JSON_FORMAT');
+
+ALTER PIPE ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_PIPE REFRESH;      -- also loads files already in the container
+SELECT SYSTEM$PIPE_STATUS('ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_PIPE');
+
+-- 11.5 With Snowpipe, RAW is filled by the pipe, so the processing task becomes its own root task:
+ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_LOAD_RAW    SUSPEND;
+ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.TASK_PROCESS_DW  SUSPEND;
+CREATE OR REPLACE TASK ECOMMERCE_DATABASE.DW_SCHEMA.ECOMMERCE_DAILY_TASK
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE  = 'USING CRON 0 1 * * * Asia/Kolkata'
+    WHEN SYSTEM$STREAM_HAS_DATA('ECOMMERCE_DATABASE.RAW_SCHEMA.ECOMMERCE_ORDER_STREAM')
+AS
+CALL ECOMMERCE_DATABASE.DW_SCHEMA.PROCESS_ECOMMERCE_DATA();
+ALTER TASK ECOMMERCE_DATABASE.DW_SCHEMA.ECOMMERCE_DAILY_TASK RESUME;
+*/
